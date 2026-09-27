@@ -25,6 +25,12 @@ final_answer、逐记录取舍原因与地址来源图；以及
 缓存：按时间非递减投喂查询事件，miss 时可附离线权威响应，模拟正向
 RRset/CNAME 各自 TTL 衰减、沿 CNAME 链取答、NXDOMAIN/NODATA 否定缓存
 与正/负项冲突清理。
+新增 `POST /api/rpz/evaluate`，在**完全禁止联网**的前提下，对按顺序
+给出的 RPZ（Response Policy Zone）策略区与一条 DNS 查询结果离线求值：
+支持 QNAME、RESPONSE-IP、NSDNAME、NSIP 四类触发器（名称精确/`*.`
+通配，地址按 RPZ 反向前缀编码），按“最小策略区序号 → 触发器次序 →
+最长匹配”选出唯一规则，识别 NXDOMAIN/NODATA/PASSTHRU/DROP/TCP-ONLY
+与改写动作，并返回命中规则、全部候选与选择理由。
 除 TLSA 校验的 PEM 证书解析使用 `cryptography`（见
 `requirements.txt`，镜像内自动安装）外，仅使用 Python 标准库
 （`http.server.ThreadingHTTPServer` + `sqlite3`）。
@@ -574,6 +580,123 @@ CNAME 多点、SOA 字段非法等）走错误响应。
 min(3600,300)=300，覆盖全部类型）；t=60 末端 A 恰到期被清，链节缺失
 而 miss（CNAME 节仍在缓存）。
 
+## 离线 RPZ 求值（`POST /api/rpz/evaluate`）
+
+不发起任何真实 DNS 查询：输入**按顺序给出的 RPZ 策略区文本**（数组
+`zones`，序号越小优先级越高）与一条 DNS 查询结果（`qname`、`qtype`
+与 `response` 的 `answer` / `authority` / `additional` 三个记录区，
+`rcode` 取 `NOERROR`/`NXDOMAIN`/`SERVFAIL`/`REFUSED`，默认
+`NOERROR`；响应记录形如 `{name, type, ttl?, rdata}`），按 RPZ 的触发器
+语义离线求值。
+
+策略区只解析区顶 `SOA`/`NS`、名称服务器 `A`/`AAAA`（区元数据）与作为
+**触发器动作的 CNAME**；触发器 owner 相对策略区源点编码：
+
+- **QNAME**：owner 直接位于区顶之下（如 `evil.example.com.` 位于源点
+  `example.com.` 之下）。名称精确匹配，或首标签为 `*` 时作单标签通配
+  （`*.wild.example.com.` 命中 `x.wild.example.com.`，不命中
+  `a.b.wild.example.com.` 与 `wild.example.com.` 自身）；
+- **RESPONSE-IP**：owner 为
+  `<前缀长度>.<反向标签>.rpz-ip.<apex>`。IPv4 反向**字节**（标签数
+  恰为 `ceil(前缀/8)`，如 `192.0.2.2/32` → `32.2.2.0.192.rpz-ip.`，
+  `192.168.0.0/24` → `24.0.168.192.rpz-ip.`，`0.rpz-ip.` 为全捕获）；
+  IPv6 反向**半字节**（标签数恰为 `ceil(前缀/4)`，如
+  `2001:db8::/64` → `64.0.0.0.0.0.0.0.0.8.b.d.0.1.0.0.2.rpz-ip.`）。
+  匹配 `response.answer` 中全部 A/AAAA 地址，**最长前缀优先**；
+- **NSDNAME**：owner 为 `<名称>.rpz-nsdname.<apex>`，支持精确或
+  `*.` 通配。应答 `answer`/`authority` 中的 NS 目标名**等于触发名或
+  位于其下**即命中（通配只下探一级）；
+- **NSIP**：owner 为 `<前缀长度>.<反向标签>.rpz-nsip.<apex>`（编码同
+  RESPONSE-IP）。应答中 NS 目标的地址取自三个记录区里以该 NS 名为
+  owner 的 A/AAAA（通常是 `additional` 胶水）；响应没有提供地址时无法
+  命中。
+
+选规则（确定性、与记录书写顺序无关）：
+
+1. **先选序号最小的、含任一触发器命中的策略区**（后续策略区不再求值，
+   除非该序号更小的区未命中任何触发器）；
+2. 再在该区内按 **QNAME → RESPONSE-IP → NSDNAME → NSIP** 的触发器
+   次序选第一个命中的触发器；
+3. 同一触发器内按**最长匹配**确定唯一规则：名称先精确后通配、再按
+   触发名标签数；地址按前缀长度（同长时 IPv4 先于 IPv6），仍并列时按
+   owner 与目标确定唯一顺序；owner/目标/TTL 完全相同的重复规则去重。
+
+CNAME 动作目标（主文件中均为根点结尾的绝对名）：
+
+| CNAME 目标 | 动作 `action` | 含义 |
+| --- | --- | --- |
+| `.` | `nxdomain` | 返回 NXDOMAIN |
+| `*.` | `nodata` | 返回 NODATA（无错误但无该类型应答） |
+| `rpz-passthru.` | `passthru` | 放行：本查询不受 RPZ 改写，并**终止后续策略区** |
+| `rpz-drop.` | `drop` | 丢弃应答 |
+| `rpz-tcp-only.` | `tcp-only` | 要求仅走 TCP |
+| 其它任意域名 | `rewrite` | 改写响应（`rewrite_target` 给出目标名） |
+
+响应 `rpz` 中：`result`/`action` 为终态（无命中时为 `unchanged`）；
+`matched_rule` 为命中规则（`trigger`、`zone_index`、`zone`、`owner`、
+`ttl`、`action`，地址规则带 `prefix_len`，改写规则带 `target`）；
+`matched_value` 为命中的查询名/IP/NS 名；`candidates` 为全部策略区中
+命中过的规则（按策略区序号与触发器次序排序，附各自 `matched_value`）；
+`selection_reason` 给出选择依据
+（`lowest_zone_index_then_trigger_order_and_longest_match` /
+`passthru_terminates_further_policy_zones` / `no_trigger_matched`）；
+`trace` 为逐策略区、逐触发器的有序求值轨迹；`zones` 给出每个策略区的
+序号、源点与规则数。记录重排（含等价写法）不改变求值结果。
+
+只有请求格式错误（`400`）与响应记录内容错误（`422`
+`invalid_record`：坏地址/坏名称）走错误响应；以下 RPZ 区域问题同样为
+**HTTP 422**，错误明细在 `error.details`（逐条给出 `index`/`code`/
+`message`）：
+
+- **非法前缀**（`invalid_prefix`）：长度与反向标签数不符、标签越界
+  （IPv4 字节 0..255、IPv6 单个十六进制数字）、半字节形式的 IPv6
+  短于 `/17`、前缀长度越界、主机位非零、地址分支出现 `*` 通配、
+  `rpz-nsdname` 分支根缺少触发名；
+- **区外 owner**（`owner_out_of_zone`）：CNAME 触发器 owner 不位于
+  本策略区源点之下；
+- **冲突 RRset**（`conflict_rrset`）：区顶 CNAME、非区顶 NS、触发器
+  owner 上 CNAME 与其它类型并存、一个 CNAME RRset 多个不同目标、
+  同一 RRset TTL 不一致、多个 SOA，或出现本服务不支持的 RR 类型
+  （如 MX/TXT）。
+
+请求体（完整示例见 `examples/rpz_evaluate.json`：qname 无 QNAME 规则、
+应答地址命中 `192.0.2.2/32` → rewrite）：
+
+```json
+{
+  "zones": [
+    "$ORIGIN example.com.\n$TTL 300\n@ IN SOA ns1 admin 1 1h 1h 1w 1h\n@ IN NS ns1\nns1 IN A 192.0.2.1\nevil CNAME .\n*.wild CNAME *.\ngood CNAME rpz-passthru.\n32.2.2.0.192.rpz-ip CNAME blocked.example.net.\nns.evil.rpz-nsdname CNAME .\n32.99.2.0.203.rpz-nsip CNAME .\n",
+    "$ORIGIN block.example.\n$TTL 300\n@ IN SOA ns1 admin 1 1h 1h 1w 1h\n@ IN NS ns1\ngood.example.com CNAME .\n"
+  ],
+  "qname": "evil.example.com.",
+  "qtype": "A",
+  "response": {
+    "rcode": "NOERROR",
+    "answer": [],
+    "authority": [],
+    "additional": []
+  }
+}
+```
+
+最小内联示例：
+
+```bash
+curl -s http://localhost:8080/api/rpz/evaluate \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "zones": [
+      "$ORIGIN example.com.\n$TTL 300\n@ IN SOA ns1 admin 1 1h 1h 1w 1h\n@ IN NS ns1\nevil CNAME .\n32.2.2.0.192.rpz-ip CNAME blocked.example.net.\n"
+    ],
+    "qname": "evil.example.com.",
+    "qtype": "A",
+    "response": {"answer": [], "authority": [], "additional": []}
+  }' | python3 -m json.tool
+# -> rpz.result = "nxdomain"（QNAME 命中 evil -> CNAME .）
+#    qname 改为 host.example.com.、answer 给 A 192.0.2.2
+#    则命中 RESPONSE-IP /32 -> result="rewrite"
+```
+
 ## API
 
 | 方法 | 路径 | 说明 |
@@ -589,6 +712,7 @@ min(3600,300)=300，覆盖全部类型）；t=60 末端 A 恰到期被清，链�
 | `POST` | `/api/axfr/inspect` | 离线检查 Base64 编码的 TCP AXFR 响应流（逐帧解析/名称解压/结构校验），返回状态、按帧轨迹与规范区域文本 |
 | `POST` | `/api/dns/delegation-trace` | 离线校验迭代解析轨迹（转介/胶水/地址子查询/CNAME 重启，共享 32 跳预算），返回 final_answer、逐记录取舍与地址来源图 |
 | `POST` | `/api/dns/cache/replay` | 离线复演递归缓存（TTL 衰减/CNAME 链取答/NXDOMAIN·NODATA 否定缓存/正负项冲突清理），逐项返回 hit·miss、答案、剩余 TTL、增删原因与最终快照 |
+| `POST` | `/api/rpz/evaluate` | 离线 RPZ 求值（QNAME/RESPONSE-IP/NSDNAME/NSIP 触发器、最小序号策略区+触发器次序+最长匹配、NXDOMAIN/NODATA/PASSTHRU/DROP/TCP-only/改写），返回命中规则、候选与选择理由 |
 | `GET`  | `/api/reviews` | 已确认审查列表 |
 | `GET`  | `/api/reviews/<id>` | 读取一条确认（含 `replay_request` 可原样复演） |
 | `GET`  | `/healthz` | 健康检查 |
@@ -696,6 +820,11 @@ curl -s http://localhost:8080/api/dns/delegation-trace \
 curl -s http://localhost:8080/api/dns/cache/replay \
   -H 'Content-Type: application/json' \
   --data @examples/dns_cache_replay.json | python3 -m json.tool
+
+# 离线 RPZ 求值（应答地址命中 192.0.2.2/32 -> rewrite 到 blocked-host）
+curl -s http://localhost:8080/api/rpz/evaluate \
+  -H 'Content-Type: application/json' \
+  --data @examples/rpz_evaluate.json | python3 -m json.tool
 ```
 
 `/api/spf/evaluate` 的最小内联示例：
@@ -791,9 +920,10 @@ app/
   axfr.py       # 离线 AXFR 响应流检查（TCP 帧切分/名称解压/SOA 首尾结构判定）
   delegation.py # 离线迭代解析轨迹校验（转介/胶水/地址子查询/CNAME 重启/32 跳预算）
   dnscache.py   # 离线 DNS 缓存复演（TTL 衰减/CNAME 链/NXDOMAIN·NODATA/冲突清理）
+  rpz.py        # 离线 RPZ 求值（QNAME/RESPONSE-IP/NSDNAME/NSIP/策略区次序与最长匹配）
   storage.py    # SQLite 持久化
   server.py     # ThreadingHTTPServer HTTP API
 requirements.txt # TLSA 证书解析依赖（cryptography；镜像内安装）
 tests/          # 单元与端到端测试
-examples/       # curl 示例请求（review.json / spf_evaluate.json / nsec_proof.json / svcb_resolve.json / caa_authorize.json / zonemd_verify.json / tlsa_verify.json / axfr_inspect.json / delegation_trace.json / dns_cache_replay.json 等）
+examples/       # curl 示例请求（review.json / spf_evaluate.json / nsec_proof.json / svcb_resolve.json / caa_authorize.json / zonemd_verify.json / tlsa_verify.json / axfr_inspect.json / delegation_trace.json / dns_cache_replay.json / rpz_evaluate.json 等）
 ```

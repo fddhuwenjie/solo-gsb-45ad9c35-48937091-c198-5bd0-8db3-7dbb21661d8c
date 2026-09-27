@@ -1,0 +1,16 @@
+{
+  "zones": [
+    "$ORIGIN example.com.\n$TTL 300\n@ IN SOA ns1.example.com. admin.example.com. 2024010100 1h 1h 1w 1h\n@ IN NS ns1.example.com.\nns1 IN A 192.0.2.1\nmalicious CNAME .\n*.wild CNAME *.\ntrusted CNAME rpz-passthru.\ndropped CNAME rpz-drop.\ntcponly CNAME rpz-tcp-only.\nmirror CNAME mirror.cdn.example.net.\n32.2.2.0.192.rpz-ip CNAME blocked-host.example.net.\n24.0.168.192.rpz-ip CNAME blocked-net.example.net.\nns.evil.rpz-nsdname CNAME .\n32.99.0.2.203.rpz-nsip CNAME .\n",
+    "$ORIGIN block.example.\n$TTL 300\n@ IN SOA ns1.example.com. admin.example.com. 2024010100 1h 1h 1w 1h\n@ IN NS ns1.example.com.\ntrusted.example.com CNAME .\n"
+  ],
+  "qname": "host.example.com.",
+  "qtype": "A",
+  "response": {
+    "rcode": "NOERROR",
+    "answer": [
+      {"name": "host.example.com.", "type": "A", "ttl": 60, "rdata": "192.0.2.2"}
+    ],
+    "authority": [],
+    "additional": []
+  }
+}
