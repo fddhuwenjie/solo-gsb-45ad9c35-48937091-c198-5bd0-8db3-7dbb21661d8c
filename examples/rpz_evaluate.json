@@ -1,0 +1,20 @@
+{
+  "zones": [
+    "$ORIGIN block.example.\n$TTL 300\n@ IN SOA ns1 admin 2024010100 1h 1h 1w 1h\n@ IN NS ns1\nns1 IN A 192.0.2.1\nwww.example.com CNAME .\n*.example.com CNAME rpz-drop.\n32.8.2.0.192.rpz-response-ip CNAME cdn.example.net.\nns.evil.example.rpz-nsdname CNAME *.\n24.2.0.192.rpz-nsip CNAME rpz-tcp-only.\n",
+    "$ORIGIN allow.example.\n$TTL 300\n@ IN SOA ns1 admin 1 1h 1h 1w 1h\n@ IN NS ns1\npartner.example.com CNAME rpz-passthru.\n"
+  ],
+  "query": {
+    "qname": "www.example.com",
+    "qtype": "A",
+    "protocol": "udp",
+    "answer": [
+      {"name": "www.example.com", "type": "A", "ttl": 60, "rdata": "192.0.2.8"}
+    ],
+    "authority": [
+      {"name": "example.com", "type": "NS", "ttl": 3600, "rdata": "ns.evil.example"}
+    ],
+    "additional": [
+      {"name": "ns.evil.example", "type": "A", "ttl": 3600, "rdata": "192.0.2.9"}
+    ]
+  }
+}

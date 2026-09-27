@@ -192,8 +192,14 @@ def _parse_duration(token: str, line_no: int) -> int:
     return value
 
 
-def normalize_name(token: str, origin: str) -> str:
-    """把名称记号规范化为小写绝对 FQDN。"""
+def normalize_name(
+    token: str, origin: str, allow_wildcard: bool = False
+) -> str:
+    """把名称记号规范化为小写绝对 FQDN。
+
+    ``allow_wildcard`` 为真时允许唯一的通配标签 ``*`` 出现在最左侧
+    （RPZ 的 ``*.`` 动作目标与通配触发器需要），其余标签仍须合法。
+    """
     name = token.lower().strip()
     if name == "@":
         return origin
@@ -203,11 +209,11 @@ def normalize_name(token: str, origin: str) -> str:
         absolute = name
     else:
         absolute = f"{name}.{origin}"
-    validate_name(absolute)
+    validate_name(absolute, allow_wildcard=allow_wildcard)
     return absolute
 
 
-def validate_name(name: str) -> None:
+def validate_name(name: str, allow_wildcard: bool = False) -> None:
     if not name.endswith("."):
         raise ZoneParseError(f"内部错误，名称非绝对名: {name!r}")
     if name == ".":
@@ -215,7 +221,10 @@ def validate_name(name: str) -> None:
     bare = name[:-1]
     if len(bare) > 253:
         raise ZoneParseError(f"名称超过 253 字节: {name!r}")
-    for label in bare.split("."):
+    labels = bare.split(".")
+    if allow_wildcard and labels and labels[0] == "*":
+        labels = labels[1:]
+    for label in labels:
         if not _LABEL_RE.fullmatch(label):
             raise ZoneParseError(f"非法名称标签: {label!r}（来自 {name!r}）")
 
@@ -1012,11 +1021,13 @@ def parse_zone(
     text: str,
     default_origin: str | None = None,
     default_ttl: int | None = None,
+    allow_wildcard: bool = False,
 ) -> Zone:
     """解析区域文本，返回规范化 Zone。
 
     源点取值：优先使用第一个 $ORIGIN 指令，否则使用 default_origin；
-    二者皆无则报错。
+    二者皆无则报错。``allow_wildcard`` 为真时允许最左标签为 ``*``
+    （供 RPZ 等通配名称场景使用）。
     """
     origin: str | None = default_origin.lower().rstrip(".") + "." if default_origin else None
     apex: str | None = None
@@ -1074,7 +1085,8 @@ def parse_zone(
                 raise ZoneParseError("记录缺少 TTL/类型/RDATA 字段", line_no)
             owner_token = line[: gap.start()]
             body = line[gap.end() :].lstrip()
-            owner = normalize_name(owner_token, origin)
+            owner = normalize_name(owner_token, origin,
+                                   allow_wildcard=allow_wildcard)
             last_owner = owner
 
         ttl: int | None = None
@@ -1138,7 +1150,9 @@ def parse_zone(
         elif rtype in ("NS", "CNAME"):
             if len(rdata_tokens) != 1:
                 raise ZoneParseError(f"{rtype} 只能有一个目标字段", line_no)
-            rdata = (normalize_name(rdata_tokens[0], origin),)
+            rdata = (normalize_name(
+                rdata_tokens[0], origin, allow_wildcard=allow_wildcard
+            ),)
         elif rtype == "MX":
             if len(rdata_tokens) != 2:
                 raise ZoneParseError(

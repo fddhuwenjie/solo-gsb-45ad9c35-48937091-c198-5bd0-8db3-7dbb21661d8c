@@ -12,6 +12,7 @@
 - ``POST /api/axfr/inspect``       离线检查 Base64 编码的 TCP AXFR 响应流
 - ``POST /api/dns/delegation-trace`` 离线校验迭代解析轨迹（转介/胶水/地址子查询）
 - ``POST /api/dns/cache/replay``     离线复演缓存（TTL 衰减/CNAME 链/否定缓存）
+- ``POST /api/rpz/evaluate``         离线求值有序 RPZ 策略区对一条查询结果的动作
 - ``GET  /api/reviews``            已确认审查列表
 - ``GET  /api/reviews/<id>``       读取已确认审查（含复演请求）
 - ``GET  /healthz``                健康检查
@@ -29,6 +30,7 @@ from .axfr import inspect_axfr
 from .delegation import trace_delegation
 from .dnscache import replay_cache
 from .review import ReviewError, perform_review
+from .rpz import evaluate_rpz
 from .spf import evaluate_spf
 from .storage import Store
 from .svcb import resolve_svcb
@@ -118,6 +120,8 @@ class Handler(BaseHTTPRequestHandler):
             self._handle_delegation_trace()
         elif path == "/api/dns/cache/replay":
             self._handle_cache_replay()
+        elif path == "/api/rpz/evaluate":
+            self._handle_rpz_evaluate()
         else:
             self._error(ReviewError("not_found", "未知路径", 404))
 
@@ -250,6 +254,18 @@ class Handler(BaseHTTPRequestHandler):
         # hit/miss 都是 200 下的复演终态；
         # 只有请求格式（400）与响应记录内容错误（422）走 _error
         self._send_json(200, {"cache_replay": result})
+
+    def _handle_rpz_evaluate(self) -> None:
+        try:
+            payload = self._read_json()
+            result = evaluate_rpz(payload)
+        except ReviewError as exc:
+            self._error(exc)
+            return
+        # unchanged/nxdomain/nodata/passthru/drop/tcp-only/rewrite 都是
+        # 200 下的 RPZ 求值终态；只有请求格式（400）与策略区加载错误
+        # （422：非法前缀/区外 owner/冲突 RRset 等）走 _error
+        self._send_json(200, {"rpz": result})
 
     def log_message(self, fmt: str, *args) -> None:
         # ThreadingHTTPServer 下把日志写到 stderr 即可

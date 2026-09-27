@@ -24,7 +24,10 @@ final_answer、逐记录取舍原因与地址来源图；以及
 `POST /api/dns/cache/replay`，在**完全禁止联网**的前提下复演一个递归
 缓存：按时间非递减投喂查询事件，miss 时可附离线权威响应，模拟正向
 RRset/CNAME 各自 TTL 衰减、沿 CNAME 链取答、NXDOMAIN/NODATA 否定缓存
-与正/负项冲突清理。
+与正/负项冲突清理；以及 `POST /api/rpz/evaluate`，离线对**按顺序给出的
+RPZ 策略区文本**与一条 DNS 查询结果求值（QNAME/RESPONSE-IP/NSDNAME/
+NSIP 触发器、`.`/`*.`/`rpz-passthru.`/`rpz-drop.`/`rpz-tcp-only.`
+动作与改写）。
 除 TLSA 校验的 PEM 证书解析使用 `cryptography`（见
 `requirements.txt`，镜像内自动安装）外，仅使用 Python 标准库
 （`http.server.ThreadingHTTPServer` + `sqlite3`）。
@@ -574,6 +577,108 @@ CNAME 多点、SOA 字段非法等）走错误响应。
 min(3600,300)=300，覆盖全部类型）；t=60 末端 A 恰到期被清，链节缺失
 而 miss（CNAME 节仍在缓存）。
 
+## 离线 RPZ 策略求值（`POST /api/rpz/evaluate`）
+
+不发起任何真实 DNS 查询：输入**按顺序给出的若干 RPZ 策略区文本**
+（`zones`，数组下标即策略优先级）与一条 DNS 查询结果（`query`：
+`qname`/`qtype`/`protocol` + `answer`/`authority`/`additional` 三个
+记录区，记录形如 `{name,type,ttl?,rdata}`），离线求值得出策略结论。
+
+触发器（owner 位于区下；括号内为保留后缀，后缀紧跟区顶）：
+
+| 触发器 | owner 形式 | 匹配数据 |
+| ---- | ---- | ---- |
+| `QNAME` | 直接位于区下 | 查询 `qname` |
+| `RESPONSE-IP` | `<rel>.rpz-response-ip.<apex>` | `answer` 中 A/AAAA 地址 |
+| `NSDNAME` | `<rel>.rpz-nsdname.<apex>` | `answer`/`authority` 中 NS 目标名 |
+| `NSIP` | `<rel>.rpz-nsip.<apex>` | 属于上述 NS 目标名的胶水 A/AAAA（`additional`/`authority`） |
+
+匹配规则：
+
+- **名称**作精确匹配，或最左标签为 `*` 的 `*.` 通配（通配**恰好匹配
+  一个标签**）；最长（匹配标签数最多）者获胜，等长时精确优先。
+- **地址**按 RPZ 反向前缀编码：首个标签为前缀长度，其后自前缀长度向
+  保留后缀方向为**低位 → 高位**排列的逆序字节（IPv4，0..255）或
+  nibble（IPv6，单个十六进制字符）；短编码省略低位（右侧补 0）。
+  如 `32.8.2.0.192.rpz-response-ip.<apex>` = 192.0.2.8/32、
+  `24.2.0.192.rpz-response-ip.<apex>` = 192.0.2.0/24、
+  `8.192.rpz-*.<apex>` = 192.0.0.0/8、
+  `16.168.192.rpz-*.<apex>` = 192.168.0.0/16；最长前缀获胜。
+
+策略选择（确定性）：
+
+1. **先选序号最小**的含命中规则的策略区；
+2. 再在该区内按 `QNAME → RESPONSE-IP → NSDNAME → NSIP` 的固定触发器
+   次序，取第一个有命中的触发器；
+3. 该触发器内取**唯一最长匹配**规则。
+   `rpz-tcp-only.` 规则在 **TCP** 查询下视为不存在（继续下一触发器）。
+
+CNAME 动作目标（owner 上的 CNAME RDATA）：
+
+| 目标 | 处置 `disposition` |
+| ---- | ---- |
+| `.` | `nxdomain`（NXDOMAIN） |
+| `*.` | `nodata`（NOERROR 无回答） |
+| `rpz-passthru.` | `passthru`（放行，且**终止**后续策略区） |
+| `rpz-drop.` | `drop`（丢弃） |
+| `rpz-tcp-only.` | `tcp-only`（UDP 回截断，要求改用 TCP） |
+| 其它任意目标 | `rewrite`（CNAME 改写到该目标） |
+
+任何命中（含 PASSTHRU）都在第一个命中策略区结束，其后策略区标记
+`evaluated=false`；没有任何规则命中时 `disposition="unchanged"`。
+
+响应 `rpz` 中：`disposition`/`action` 为结论；`matched_rule` 为命中规则
+（含 `zone_index`/`trigger`/`owner`/`target`/`action`、名称触发器的
+`name_pattern`+`match` 或地址触发器的 `network`+`prefix_len`），
+`matched_value` 为实际命中的名字/地址；`candidates` 为求值中出现的
+**全部命中候选**（含未被选中的触发器/策略区，按策略区与触发器次序
+排序，`eligible=false` 标注 TCP 下被跳过的 tcp-only 规则）；
+`selection_reason` 给出选择理由；`facts` 为从查询结果提取的
+answer IP / NS 名 / NS 胶水 IP 集合；`zones` 逐区给出规则数与被忽略的
+非策略记录（区顶 SOA/NS 与 in-bailiwick 胶水等）；`trace` 为
+`zone → trigger → selected → result` 的有序轨迹。**记录书写顺序
+重排不改变结论**（相同输入产生完全相同的输出）。
+
+加载期错误（均为 **422**）：
+
+- 非法触发器前缀编码（`rpz_invalid_prefix`：前缀长度越界、非数字、
+  IPv4 字节越界或 IPv6 nibble 非单字符、地址触发器带通配等）；
+- 区外 owner（`rpz_owner_out_of_zone`：绝对名不位于区顶之下）；
+- 区顶策略 CNAME（`rpz_apex_policy`）；
+- 冲突 RRset（`rpz_conflicting_rrset`：策略 owner 上 CNAME 与其它类型
+  共存，或同一 CNAME RRset 存在多个不同目标）；
+- 区域文本本身解析失败（`rpz_zone_parse_error`）。
+
+`disposition` 各值均为 **HTTP 200** 下的求值终态；只有请求格式错误
+（`400`）与上述策略区加载错误（`422`）走错误响应。
+
+请求体（完整示例见 `examples/rpz_evaluate.json`；本例 QNAME
+`www.example.com` 在第 0 个策略区精确命中 `.` → `nxdomain`，尽管
+answer IP、NS 名/IP 同时命中后续触发器）：
+
+```json
+{
+  "zones": [
+    "$ORIGIN block.example.\n$TTL 300\n@ IN SOA ns1 admin 1 1h 1h 1w 1h\n@ IN NS ns1\nns1 IN A 192.0.2.1\nwww.example.com CNAME .\n*.example.com CNAME rpz-drop.\n32.8.2.0.192.rpz-response-ip CNAME cdn.example.net.\nns.evil.example.rpz-nsdname CNAME *.\n24.2.0.192.rpz-nsip CNAME rpz-tcp-only.\n",
+    "$ORIGIN allow.example.\n$TTL 300\n@ IN SOA ns1 admin 1 1h 1h 1w 1h\n@ IN NS ns1\npartner.example.com CNAME rpz-passthru.\n"
+  ],
+  "query": {
+    "qname": "www.example.com",
+    "qtype": "A",
+    "protocol": "udp",
+    "answer": [
+      {"name": "www.example.com", "type": "A", "ttl": 60, "rdata": "192.0.2.8"}
+    ],
+    "authority": [
+      {"name": "example.com", "type": "NS", "ttl": 3600, "rdata": "ns.evil.example"}
+    ],
+    "additional": [
+      {"name": "ns.evil.example", "type": "A", "ttl": 3600, "rdata": "192.0.2.9"}
+    ]
+  }
+}
+```
+
 ## API
 
 | 方法 | 路径 | 说明 |
@@ -589,6 +694,7 @@ min(3600,300)=300，覆盖全部类型）；t=60 末端 A 恰到期被清，链�
 | `POST` | `/api/axfr/inspect` | 离线检查 Base64 编码的 TCP AXFR 响应流（逐帧解析/名称解压/结构校验），返回状态、按帧轨迹与规范区域文本 |
 | `POST` | `/api/dns/delegation-trace` | 离线校验迭代解析轨迹（转介/胶水/地址子查询/CNAME 重启，共享 32 跳预算），返回 final_answer、逐记录取舍与地址来源图 |
 | `POST` | `/api/dns/cache/replay` | 离线复演递归缓存（TTL 衰减/CNAME 链取答/NXDOMAIN·NODATA 否定缓存/正负项冲突清理），逐项返回 hit·miss、答案、剩余 TTL、增删原因与最终快照 |
+| `POST` | `/api/rpz/evaluate` | 离线对有序 RPZ 策略区与一条查询结果求值（QNAME/RESPONSE-IP/NSDNAME/NSIP，`.`/`*.`/passthru/drop/tcp-only/改写），返回处置、命中规则、候选与选择理由 |
 | `GET`  | `/api/reviews` | 已确认审查列表 |
 | `GET`  | `/api/reviews/<id>` | 读取一条确认（含 `replay_request` 可原样复演） |
 | `GET`  | `/healthz` | 健康检查 |
@@ -696,6 +802,11 @@ curl -s http://localhost:8080/api/dns/delegation-trace \
 curl -s http://localhost:8080/api/dns/cache/replay \
   -H 'Content-Type: application/json' \
   --data @examples/dns_cache_replay.json | python3 -m json.tool
+
+# 离线 RPZ 策略求值（www.example.com 在最小序号策略区 QNAME 精确命中 -> nxdomain）
+curl -s http://localhost:8080/api/rpz/evaluate \
+  -H 'Content-Type: application/json' \
+  --data @examples/rpz_evaluate.json | python3 -m json.tool
 ```
 
 `/api/spf/evaluate` 的最小内联示例：
@@ -791,9 +902,10 @@ app/
   axfr.py       # 离线 AXFR 响应流检查（TCP 帧切分/名称解压/SOA 首尾结构判定）
   delegation.py # 离线迭代解析轨迹校验（转介/胶水/地址子查询/CNAME 重启/32 跳预算）
   dnscache.py   # 离线 DNS 缓存复演（TTL 衰减/CNAME 链/NXDOMAIN·NODATA/冲突清理）
+  rpz.py        # 离线 RPZ 策略求值（QNAME/RESPONSE-IP/NSDNAME/NSIP 触发器与动作）
   storage.py    # SQLite 持久化
   server.py     # ThreadingHTTPServer HTTP API
 requirements.txt # TLSA 证书解析依赖（cryptography；镜像内安装）
 tests/          # 单元与端到端测试
-examples/       # curl 示例请求（review.json / spf_evaluate.json / nsec_proof.json / svcb_resolve.json / caa_authorize.json / zonemd_verify.json / tlsa_verify.json / axfr_inspect.json / delegation_trace.json / dns_cache_replay.json 等）
+examples/       # curl 示例请求（review.json / spf_evaluate.json / nsec_proof.json / svcb_resolve.json / caa_authorize.json / zonemd_verify.json / tlsa_verify.json / axfr_inspect.json / delegation_trace.json / dns_cache_replay.json / rpz_evaluate.json 等）
 ```

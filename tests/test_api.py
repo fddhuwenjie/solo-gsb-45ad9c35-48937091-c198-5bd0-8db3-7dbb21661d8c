@@ -228,5 +228,87 @@ mail IN A 192.0.2.50
                          json.dumps(b2, sort_keys=True))
 
 
+class RpzApiTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.server = build_server("127.0.0.1", 0, ":memory:")
+        cls.port = cls.server.server_address[1]
+        cls.thread = threading.Thread(target=cls.server.serve_forever,
+                                      daemon=True)
+        cls.thread.start()
+        cls.base = f"http://127.0.0.1:{cls.port}"
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.server.shutdown()
+        cls.server.server_close()
+
+    ZONE = (
+        "$ORIGIN rpz.example.\n$TTL 300\n"
+        "@ IN SOA ns1 admin 1 1h 1h 1w 1h\n@ IN NS ns1\n"
+        "ns1 IN A 192.0.2.1\n"
+        "www.example.com CNAME .\n"
+        "*.example.com CNAME rpz-drop.\n"
+        "24.2.0.192.rpz-response-ip CNAME cdn.example.net.\n"
+    )
+
+    def _evaluate(self, **overrides):
+        payload = {
+            "zones": [self.ZONE],
+            "query": {
+                "qname": "www.example.com",
+                "qtype": "A",
+                "protocol": "udp",
+                "answer": [],
+                "authority": [],
+                "additional": [],
+            },
+        }
+        payload.update(overrides)
+        return _request(self.base + "/api/rpz/evaluate", payload)
+
+    def test_qname_nxdomain(self):
+        status, body = self._evaluate()
+        self.assertEqual(status, 200, body)
+        rpz = body["rpz"]
+        self.assertEqual(rpz["disposition"], "nxdomain")
+        self.assertEqual(rpz["matched_rule"]["trigger"], "qname")
+
+    def test_wildcard_and_response_ip(self):
+        status, body = self._evaluate(
+            query={"qname": "mail.example.com", "qtype": "A",
+                   "answer": [], "authority": [], "additional": []})
+        self.assertEqual(status, 200)
+        self.assertEqual(body["rpz"]["disposition"], "drop")
+
+        status, body = self._evaluate(
+            query={"qname": "h.example.org", "qtype": "A",
+                   "answer": [{"name": "h.example.org", "type": "A",
+                               "rdata": "192.0.2.9"}],
+                   "authority": [], "additional": []})
+        self.assertEqual(status, 200)
+        self.assertEqual(body["rpz"]["disposition"], "rewrite")
+        self.assertEqual(body["rpz"]["trigger"], "response-ip")
+
+    def test_unchanged(self):
+        status, body = self._evaluate(
+            query={"qname": "a.b.other.net", "qtype": "A",
+                   "answer": [], "authority": [], "additional": []})
+        self.assertEqual(status, 200)
+        self.assertEqual(body["rpz"]["disposition"], "unchanged")
+        self.assertIsNone(body["rpz"]["matched_rule"])
+
+    def test_bad_prefix_422(self):
+        bad = self.ZONE + "33.1.2.3.4.rpz-nsip CNAME .\n"
+        status, body = self._evaluate(zones=[bad])
+        self.assertEqual(status, 422)
+        self.assertEqual(body["error"]["code"], "rpz_invalid_prefix")
+
+    def test_bad_request_400(self):
+        status, body = self._evaluate(zones=[])
+        self.assertEqual(status, 400)
+        self.assertEqual(body["error"]["code"], "invalid_request")
+
+
 if __name__ == "__main__":
     unittest.main()
